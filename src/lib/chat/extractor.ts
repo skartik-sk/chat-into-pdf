@@ -8,6 +8,7 @@ import type { ChatBlock, ChatDocument, ChatMessage, ChatProvider, ChatRole } fro
 type FetchLike = (input: URL | string, init?: RequestInit) => Promise<Response>;
 
 const CHATGPT_SELECTOR = "[data-message-author-role]";
+const GEMINI_SHARE_RPC_ID = "ujx1Bf";
 const FETCH_TIMEOUT_MS = 18_000;
 const MAX_SCRIPT_TEXT_CANDIDATES = 60;
 
@@ -16,16 +17,22 @@ export async function extractChatFromUrl(input: unknown, fetcher: FetchLike = fe
   const html = await fetchHtml(url, fetcher);
   const $ = load(html);
   const provider = detectProvider(url, html);
-  const initialTitle = extractTitle($, provider);
+  let initialTitle = extractTitle($, provider);
   const warnings: string[] = [];
 
-  const extractedMessages =
+  let extractedMessages =
     extractChatGptMessages($) ??
     (provider === "chatgpt" ? extractChatGptEmbeddedMessages($) : null) ??
     extractProviderReadableBlocks($, provider) ??
     extractProviderHints($, provider) ??
     (provider === "generic" || provider === "claude" ? extractGenericReadableBlocks($) : null) ??
     (provider === "chatgpt" || provider === "generic" ? extractScriptTextFallback($) : null);
+
+  if (!extractedMessages?.length && provider === "gemini") {
+    const geminiShare = await fetchGeminiShare(url, fetcher);
+    extractedMessages = geminiShare?.messages ?? null;
+    initialTitle = geminiShare?.title ?? initialTitle;
+  }
 
   if (!extractedMessages?.length) {
     if (provider === "gemini") {
@@ -448,6 +455,208 @@ function extractReadableRoot(
   }
 
   return [{ role: "unknown", label, blocks }];
+}
+
+async function fetchGeminiShare(
+  url: URL,
+  fetcher: FetchLike,
+): Promise<{ messages: ChatMessage[]; title?: string } | null> {
+  const shareId = extractGeminiShareId(url);
+  if (!shareId) {
+    return null;
+  }
+
+  const endpoint = new URL("https://gemini.google.com/_/BardChatUi/data/batchexecute");
+  endpoint.searchParams.set("rpcids", GEMINI_SHARE_RPC_ID);
+  endpoint.searchParams.set("source-path", `/share/${shareId}`);
+  endpoint.searchParams.set("hl", "en-US");
+  endpoint.searchParams.set("rt", "c");
+
+  const requestPayload = JSON.stringify([
+    [[GEMINI_SHARE_RPC_ID, JSON.stringify([null, shareId, [4]]), null, "generic"]],
+  ]);
+  const body = new URLSearchParams({ "f.req": requestPayload });
+
+  const response = await fetcher(endpoint, {
+    method: "POST",
+    redirect: "follow",
+    headers: {
+      accept: "*/*",
+      "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+      origin: "https://gemini.google.com",
+      referer: `https://gemini.google.com/share/${shareId}`,
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36 ChatIntoPdf/1.0",
+      "x-same-domain": "1",
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  return extractGeminiShareFromBatch(await response.text());
+}
+
+function extractGeminiShareId(url: URL): string | null {
+  const match = url.pathname.match(/(?:\/gemini)?\/share\/([^/?#]+)/i);
+  return match?.[1] ?? null;
+}
+
+function extractGeminiShareFromBatch(batchText: string): { messages: ChatMessage[]; title?: string } | null {
+  for (const line of batchText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("[[")) {
+      continue;
+    }
+
+    try {
+      const batch = JSON.parse(trimmed) as unknown;
+      const payloadText = findGeminiPayloadText(batch);
+      if (!payloadText) {
+        continue;
+      }
+
+      const payload = JSON.parse(payloadText) as unknown;
+      const messages = extractGeminiMessagesFromPayload(payload);
+      if (messages?.length) {
+        return {
+          messages,
+          title: extractGeminiTitleFromPayload(payload) ?? undefined,
+        };
+      }
+    } catch {
+      // Ignore non-payload response lines.
+    }
+  }
+
+  return null;
+}
+
+function findGeminiPayloadText(value: unknown): string | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  for (const item of value) {
+    if (
+      Array.isArray(item) &&
+      item[0] === "wrb.fr" &&
+      item[1] === GEMINI_SHARE_RPC_ID &&
+      typeof item[2] === "string"
+    ) {
+      return item[2];
+    }
+  }
+
+  return null;
+}
+
+function extractGeminiMessagesFromPayload(payload: unknown): ChatMessage[] | null {
+  const envelope = Array.isArray(payload) ? payload[0] : null;
+  const turns = Array.isArray(envelope) && Array.isArray(envelope[1]) ? envelope[1] : null;
+  if (!turns) {
+    return null;
+  }
+
+  const messages: ChatMessage[] = [];
+
+  for (const turn of turns) {
+    const userText = readGeminiUserText(turn);
+    if (userText) {
+      const blocks = markdownToBlocks(sanitizeGeminiMarkdown(userText));
+      if (blocks.length) {
+        messages.push({ role: "user", blocks });
+      }
+    }
+
+    const assistantText = readGeminiAssistantText(turn);
+    if (assistantText) {
+      const blocks = markdownToBlocks(sanitizeGeminiMarkdown(assistantText));
+      if (blocks.length) {
+        messages.push({ role: "assistant", blocks });
+      }
+    }
+  }
+
+  return messages.length ? messages : null;
+}
+
+function extractGeminiTitleFromPayload(payload: unknown): string | null {
+  const envelope = Array.isArray(payload) ? payload[0] : null;
+  const metadata = Array.isArray(envelope) ? envelope[2] : null;
+  const title = Array.isArray(metadata) && typeof metadata[1] === "string" ? normalizeText(metadata[1]) : "";
+
+  return title || null;
+}
+
+function readGeminiUserText(turn: unknown): string | null {
+  if (!Array.isArray(turn)) {
+    return null;
+  }
+
+  const userCandidate = turn[2];
+  if (!Array.isArray(userCandidate)) {
+    return null;
+  }
+
+  const parts = userCandidate[0];
+  if (!Array.isArray(parts) || typeof parts[0] !== "string") {
+    return null;
+  }
+
+  return normalizeText(parts[0]);
+}
+
+function readGeminiAssistantText(turn: unknown): string | null {
+  if (!Array.isArray(turn)) {
+    return null;
+  }
+
+  const response = turn[3];
+  const candidates = Array.isArray(response) && Array.isArray(response[0]) ? response[0] : [];
+  const textParts: string[] = [];
+
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate) || !Array.isArray(candidate[1])) {
+      continue;
+    }
+
+    for (const part of candidate[1]) {
+      if (typeof part === "string" && part.trim()) {
+        textParts.push(part);
+      }
+    }
+  }
+
+  const text = textParts.join("\n\n");
+  return text ? normalizeText(text) : null;
+}
+
+function sanitizeGeminiMarkdown(markdown: string): string {
+  return markdown
+    .replace(/<Timeline>/gi, "")
+    .replace(/<\/Timeline>/gi, "")
+    .replace(/<TimelineEvent\s+([^>]*)>/gi, (_, attributes: string) => {
+      const time = readHtmlAttribute(attributes, "time");
+      const title = readHtmlAttribute(attributes, "title");
+      return `\n### ${[time, title].filter(Boolean).join(" - ")}\n`;
+    })
+    .replace(/<\/TimelineEvent>/gi, "")
+    .replace(/<Image\s+([^>]*)\/?>/gi, (_, attributes: string) => {
+      const caption = readHtmlAttribute(attributes, "caption");
+      const alt = readHtmlAttribute(attributes, "alt");
+      return `\n> Image: ${caption || alt || "Gemini generated image reference"}\n`;
+    })
+    .replace(/<FollowUp\s+[^>]*\/?>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function readHtmlAttribute(attributes: string, name: string): string {
+  const match = attributes.match(new RegExp(`${name}="([^"]*)"`, "i"));
+  return match ? normalizeText(match[1]) : "";
 }
 
 function extractScriptTextFallback($: ReturnType<typeof load>): ChatMessage[] | null {

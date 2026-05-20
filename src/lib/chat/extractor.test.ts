@@ -159,6 +159,40 @@ describe("extractChatFromUrl", () => {
       extractChatFromUrl("https://g.co/gemini/share/9798ddf30a47", mockHtmlFetch(html)),
     ).rejects.toThrow("Gemini did not expose readable chat text");
   });
+
+  test("fetches Gemini share payloads from the public batch endpoint", async () => {
+    const html = `<!doctype html><html><head>
+      <title>‎Gemini - direct access to Google AI</title>
+      <meta property="og:title" content="‎Gemini - direct access to Google AI" />
+    </head><body><chat-app id="app-root"></chat-app></body></html>`;
+
+    const document = await extractChatFromUrl(
+      "https://gemini.google.com/share/2fd90c9b0e48",
+      async (input, init) => {
+        const target = input.toString();
+        if (target.includes("/_/BardChatUi/data/batchexecute")) {
+          expect(init?.method).toBe("POST");
+          expect(String(init?.body)).toContain("f.req=");
+          return new Response(geminiBatchResponse, {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
+        }
+
+        return new Response(html, {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      },
+    );
+
+    expect(document.provider).toBe("gemini");
+    expect(document.title).toBe("Web Engineering Unit 1 Explained");
+    expect(document.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(document.messages[0]?.blocks.some((block) => block.type === "paragraph")).toBe(true);
+    expect(document.messages[1]?.blocks.some((block) => block.type === "table")).toBe(true);
+    expect(document.messages[1]?.blocks.some((block) => block.type === "quote")).toBe(true);
+  });
 });
 
 function mockHtmlFetch(html: string): (input: URL | string, init?: RequestInit) => Promise<Response> {
@@ -239,3 +273,52 @@ const genericTitleStreamTable = [
     "ok !1Soft Computing: Introduction and applications. Artificial Intelligence : production systems and search strategies.",
   ],
 ];
+
+const geminiBatchPayload = [
+  [
+    null,
+    [
+      [
+        ["conversation-id", "request-id"],
+        null,
+        [
+          [
+            "I have my paper. UNIT- I: Web Engineering: Introduction, History, Evolution and Need.",
+            null,
+            null,
+            null,
+            [[]],
+          ],
+          2,
+          null,
+          1,
+          "client-id",
+        ],
+        [
+          [
+            [
+              "response-id",
+              [
+                "### Web Engineering Fundamentals\n\n| Topic | Meaning |\n| --- | --- |\n| Web Engineering | Systematic web app development |\n\n<Image alt=\"TCP/IP diagram\" caption=\"TCP/IP Model Architecture\" src=\"image_agent_tag\" />",
+              ],
+            ],
+          ],
+          null,
+          null,
+          "response-id",
+        ],
+        [1779298076, 494323000],
+      ],
+    ],
+    [true, "Web Engineering Unit 1 Explained", null, null, null, ["", "", ""], null, [2, "model-id", "3.1 Pro"]],
+    "2fd90c9b0e48",
+    [1779302933, 335948000],
+  ],
+  null,
+  false,
+];
+
+const geminiBatchResponse = `)]}'
+
+${JSON.stringify([["wrb.fr", "ujx1Bf", JSON.stringify(geminiBatchPayload), null, null, null, "generic"]])}
+`;
